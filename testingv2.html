@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Extract one folder from ZIP (up to 700MB)</title>
+<style>
+  :root{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;}
+  body{max-width:900px;margin:28px auto;padding:18px;background:#f7f8fb;border-radius:10px;box-shadow:0 6px 22px rgba(20,30,60,.08)}
+  h1{font-size:20px;margin:0 0 12px}
+  p{margin:6px 0 12px;color:#333}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  input[type="file"]{padding:8px}
+  button{padding:8px 12px;border-radius:8px;border:0;background:#0b63d6;color:#fff;cursor:pointer}
+  button.secondary{background:#6c757d}
+  .panel{background:#fff;padding:12px;border-radius:8px;border:1px solid #e6e9ef}
+  ul{margin:8px 0 12px;padding-left:18px}
+  .progress{height:10px;background:#eee;border-radius:6px;overflow:hidden;margin-top:8px}
+  .bar{height:100%;width:0%;background:#0b63d6}
+  .log{font-family:monospace;font-size:13px;background:#0f172429;padding:8px;border-radius:6px;white-space:pre-wrap;max-height:220px;overflow:auto;margin-top:10px}
+  label{display:block;margin:6px 0}
+  .hint{color:#555;font-size:13px}
+  .danger{color:#a00;font-weight:600}
+</style>
+</head>
+<body>
+  <h1>Extract a single folder from a ZIP (≤ 700 MB)</h1>
+  <p>Choose a ZIP from your computer, pick one folder inside it, and either <strong>write that folder to a folder you choose</strong> (recommended on Chrome/Edge) or fall back to <strong>download a new ZIP containing just that folder</strong>.</p>
+
+  <div class="panel">
+    <div class="controls">
+      <input id="zipFile" type="file" accept=".zip,application/zip" />
+      <button id="scan" class="secondary">Scan ZIP</button>
+      <button id="clear">Clear</button>
+    </div>
+
+    <div id="meta" style="display:none">
+      <div class="hint" id="zipInfo"></div>
+      <label>Choose a folder inside the ZIP:</label>
+      <div id="foldersList"></div>
+      <div style="margin-top:8px">
+        <button id="extractFs">Extract to a folder on my computer (recommended)</button>
+        <button id="downloadZip" class="secondary">Download selected folder as .zip (fallback)</button>
+        <button id="individual" class="secondary">Download files individually (browser prompts many saves)</button>
+      </div>
+
+      <div class="progress" aria-hidden="true" title="progress" style="margin-top:10px"><div id="bar" class="bar"></div></div>
+      <div class="log" id="log" hidden></div>
+    </div>
+
+    <div id="notes" style="margin-top:12px" class="hint">
+      <div>Limits & notes:</div>
+      <ul>
+        <li>Maximum uploaded ZIP file size enforced: <strong>700 MB</strong>.</li>
+        <li>The extraction-to-folder operation uses the <code>File System Access API</code> (Chrome/Edge). If your browser doesn't support it, the page will instead create a downloadable ZIP (fallback).</li>
+        <li>Large archives (hundreds of MB) may be slow or run into memory limits. If that happens, try extracting locally with a native unzip tool.</li>
+      </ul>
+    </div>
+  </div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+(async function(){
+  const ZIP_SIZE_LIMIT = 700 * 1024 * 1024; // 700 MiB = 700 * 1024^2 = 734,003,200 bytes
+  const zipInput = document.getElementById('zipFile');
+  const scanBtn = document.getElementById('scan');
+  const clearBtn = document.getElementById('clear');
+  const meta = document.getElementById('meta');
+  const zipInfo = document.getElementById('zipInfo');
+  const foldersList = document.getElementById('foldersList');
+  const extractFsBtn = document.getElementById('extractFs');
+  const downloadZipBtn = document.getElementById('downloadZip');
+  const individualBtn = document.getElementById('individual');
+  const bar = document.getElementById('bar');
+  const logBox = document.getElementById('log');
+
+  let currentZip = null;
+  let currentZipName = '';
+  let folders = [];
+  let zipObject = null;
+
+  function log(txt, isError=false){
+    logBox.hidden = false;
+    const p = (new Date()).toLocaleTimeString() + ' — ' + txt;
+    logBox.textContent += p + "\\n";
+    logBox.scrollTop = logBox.scrollHeight;
+    if(isError) console.error(txt);
+  }
+
+  function resetUI(){
+    meta.style.display = 'none';
+    foldersList.innerHTML = '';
+    zipInfo.textContent = '';
+    bar.style.width = '0%';
+    logBox.textContent = '';
+    logBox.hidden = true;
+    currentZip = null;
+    zipObject = null;
+    folders = [];
+  }
+
+  clearBtn.addEventListener('click', ()=>{ zipInput.value = ''; resetUI(); });
+
+  scanBtn.addEventListener('click', async ()=>{
+    resetUI();
+    const file = zipInput.files && zipInput.files[0];
+    if(!file){ alert('Please pick a .zip file first.'); return; }
+
+    if(file.size > ZIP_SIZE_LIMIT){
+      alert('The selected zip is larger than 700 MB. Please select a smaller file.');
+      return;
+    }
+
+    currentZip = file;
+    currentZipName = file.name.replace(/\\.zip$/i,'') || 'archive';
+
+    zipInfo.textContent = `Reading file: ${file.name} — ${(file.size/1024/1024).toFixed(2)} MB`;
+    meta.style.display = '';
+
+    try{
+      log('Loading ZIP into memory (this may take time for large files)...');
+      const ab = await file.arrayBuffer();
+      log('Parsing ZIP with JSZip...');
+      zipObject = await JSZip.loadAsync(ab, { createFolders: true });
+      log('ZIP parsed. Enumerating entries...');
+    }catch(err){
+      log('Failed to read or parse ZIP: ' + err, true);
+      alert('Failed to read or parse ZIP. See console/log for details.');
+      return;
+    }
+
+    // collect folder paths (top-level and deeper choices)
+    const foldersSet = new Set();
+    // list unique folder paths (directory-like)
+    Object.keys(zipObject.files).forEach(filename => {
+      // normalize to forward slashes
+      const name = filename.replace(/\\\\/g,'/');
+      // if this is file inside path 'a/b/c.txt' we should add 'a' and 'a/b' etc as selectable folders
+      const parts = name.split('/');
+      if(parts.length <= 1) {
+        // it's a root-level file
+        foldersSet.add(''); // option to select root (all files)
+      } else {
+        // add incremental paths as options (omit trailing empty)
+        let accum = '';
+        for(let i=0;i<parts.length-1;i++){
+          accum += (i===0? '' : '/') + parts[i];
+          foldersSet.add(accum);
+        }
+      }
+    });
+
+    // create sorted list: prefer non-empty paths first, then root as "(root)"
+    const tmp = Array.from(foldersSet).filter(x=>x!=='').sort((a,b)=>a.localeCompare(b));
+    if(foldersSet.has('')) tmp.unshift('');
+    folders = tmp;
+
+    // generate UI
+    foldersList.innerHTML = '';
+    if(folders.length === 0){
+      foldersList.innerHTML = '<div class="hint">No folders found in ZIP.</div>';
+    } else {
+      const ul = document.createElement('ul');
+      folders.forEach((f, idx) => {
+        const li = document.createElement('li');
+        const id = 'f_' + idx;
+        const label = document.createElement('label');
+        label.htmlFor = id;
+        label.style.cursor = 'pointer';
+        const radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = 'selectFolder';
+        radio.id = id;
+        radio.value = f;
+        if(idx===0) radio.checked = true;
+        label.appendChild(radio);
+        label.appendChild(document.createTextNode(' ' + (f === '' ? '(root of ZIP - all root files)' : f)));
+        li.appendChild(label);
+        ul.appendChild(li);
+      });
+      foldersList.appendChild(ul);
+    }
+
+    // show counts
+    const counts = {};
+    Object.keys(zipObject.files).forEach(fn=>{
+      const name = fn.replace(/\\\\/g,'/');
+      folders.forEach(folder=>{
+        const prefix = folder === '' ? '' : folder + '/';
+        if(name.startsWith(prefix)) counts[folder] = (counts[folder]||0) + (zipObject.files[fn].dir ? 0 : 1);
+      });
+    });
+    const countsText = folders.map(f => `${f==='' ? '(root)' : f}: ${counts[f]||0} files`).join(' · ');
+    zipInfo.textContent += ' · folder file counts: ' + countsText;
+    log('Scan complete. Choose a folder and extraction option.');
+  });
+
+  // helper: get selected folder string
+  function getSelectedFolder(){ const r = document.querySelector('input[name="selectFolder"]:checked'); return r ? r.value : ''; }
+
+  // helper: update progress UI
+  function setProgress(percentage){
+    bar.style.width = Math.max(0, Math.min(100, percentage)) + '%';
+  }
+
+  // helper: ensure directory structure exists (File System Access API)
+  async function getOrCreateDirectory(rootHandle, pathParts){
+    let dir = rootHandle;
+    for(const part of pathParts){
+      if(part === '') continue;
+      dir = await dir.getDirectoryHandle(part, { create: true });
+    }
+    return dir;
+  }
+
+  // Extract to actual directory via File System Access API
+  extractFsBtn.addEventListener('click', async ()=>{
+    if(!zipObject){ alert('No ZIP loaded. Click "Scan ZIP" first.'); return; }
+    const selected = getSelectedFolder();
+    try{
+      if(!window.showDirectoryPicker){
+        alert('Your browser does not support the File System Access API. Falling back to ZIP download.');
+        return downloadSelectedAsZip();
+      }
+      // ask user for destination folder
+      log('Opening directory picker — choose where to extract the selected folder.');
+      const rootHandle = await window.showDirectoryPicker();
+      log('Directory chosen. Starting extraction...');
+      // collect entries
+      const entries = Object.keys(zipObject.files).filter(fn=>{
+        const n = fn.replace(/\\\\/g,'/');
+        const prefix = selected === '' ? '' : (selected + '/');
+        return n.startsWith(prefix) && !zipObject.files[fn].dir; // only files
+      });
+
+      if(entries.length === 0){ alert('No files found inside the selected folder.'); return; }
+
+      const total = entries.length;
+      let done = 0;
+      setProgress(0);
+
+      for(const fn of entries){
+        const zipEntry = zipObject.files[fn];
+        const relPath = fn.replace(/\\\\/g,'/').slice((selected === '' ? 0 : selected.length + 1)); // remove selected prefix
+        const parts = relPath.split('/');
+        const fileName = parts.pop();
+        const dirParts = parts.length ? parts : [];
+        // create subdirs under chosen root
+        const targetDir = await getOrCreateDirectory(rootHandle, dirParts);
+        const fileHandle = await targetDir.getFileHandle(fileName, { create: true });
+        const writable = await fileHandle.createWritable();
+        const data = await zipEntry.async('uint8array');
+        await writable.write(data);
+        await writable.close();
+        done++;
+        setProgress(Math.round(done/total*100));
+        log(`Wrote: ${relPath} (${done}/${total})`);
+      }
+      setProgress(100);
+      log('Extraction finished — files written to the folder you selected.');
+      alert('Extraction finished. Check the folder you selected for the extracted files.');
+    }catch(err){
+      log('Error while extracting to filesystem: ' + err, true);
+      alert('Extraction to folder failed. See log. Falling back to creating a downloadable zip.');
+      downloadSelectedAsZip();
+    }
+  });
+
+  // fallback: create a new zip containing only the selected folder and offer for download
+  async function downloadSelectedAsZip(){
+    const selected = getSelectedFolder();
+    if(!zipObject) return alert('No ZIP loaded.');
+    log('Creating fallback ZIP with the selected folder contents...');
+    const outZip = new JSZip();
+    const entries = Object.keys(zipObject.files).filter(fn=>{
+      const n = fn.replace(/\\\\/g,'/');
+      const prefix = selected === '' ? '' : (selected + '/');
+      return n.startsWith(prefix) && !zipObject.files[fn].dir;
+    });
+
+    if(entries.length === 0){ alert('No files found inside the selected folder.'); return; }
+    let done = 0;
+    const total = entries.length;
+    setProgress(0);
+    for(const fn of entries){
+      const zipEntry = zipObject.files[fn];
+      const relPath = fn.replace(/\\\\/g,'/').slice((selected === '' ? 0 : selected.length + 1));
+      outZip.file(relPath, await zipEntry.async('uint8array'));
+      done++;
+      setProgress(Math.round(done/total*100));
+    }
+    const blob = await outZip.generateAsync({type:'blob'}, meta => {
+      if(meta && meta.percent) setProgress(Math.round(meta.percent));
+    });
+    const name = (selected === '' ? currentZipName + '-root' : selected.replace(/[\\/]/g,'_')) + '.zip';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    setProgress(100);
+    log('Download ready: ' + name);
+    alert('Fallback ZIP created and download started.');
+  }
+
+  downloadZipBtn.addEventListener('click', async ()=>{
+    try{
+      await downloadSelectedAsZip();
+    }catch(err){
+      log('Error in fallback download: ' + err, true);
+      alert('Error creating fallback zip: ' + err);
+    }
+  });
+
+  // Option: create individual downloads for each file (will prompt many "Save as" dialogs)
+  individualBtn.addEventListener('click', async ()=>{
+    if(!zipObject) return alert('No ZIP loaded.');
+    const selected = getSelectedFolder();
+    const entries = Object.keys(zipObject.files).filter(fn=>{
+      const n = fn.replace(/\\\\/g,'/');
+      const prefix = selected === '' ? '' : (selected + '/');
+      return n.startsWith(prefix) && !zipObject.files[fn].dir;
+    });
+    if(entries.length === 0) return alert('No files to download inside the selected folder.');
+
+    setProgress(0);
+    let done = 0;
+    for(const fn of entries){
+      const zipEntry = zipObject.files[fn];
+      const relPath = fn.replace(/\\\\/g,'/').slice((selected === '' ? 0 : selected.length + 1));
+      const blob = new Blob([await zipEntry.async('uint8array')]);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = relPath.split('/').pop() || 'file';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      done++;
+      setProgress(Math.round(done/entries.length*100));
+      log('Triggered download for: ' + relPath);
+      // small delay to reduce browser throttling (very small)
+      await new Promise(r=>setTimeout(r,60));
+    }
+    setProgress(100);
+    alert('Triggered browser downloads for each file. You will get a Save prompt for each file.');
+  });
+
+})();
+</script>
+</body>
+</html>
